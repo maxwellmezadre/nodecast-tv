@@ -26,8 +26,8 @@ const sessions = new Map();
 const CACHE_DIR = path.join(process.cwd(), 'transcode-cache');
 
 // Session settings
-const SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes idle timeout
-const SEGMENT_DURATION = 4; // seconds per HLS segment
+const SESSION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes idle timeout
+const SEGMENT_DURATION = 2; // seconds per HLS segment — shorter = faster start, more segments
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // Check every 5 minutes
 
 /**
@@ -192,11 +192,14 @@ class TranscodeSession extends EventEmitter {
             this.addHwAccelInputArgs(args, encoder);
         }
 
-        // Input options (common)
+        // Input options (common).
+        // Smaller probe/analyze cuts ~3-5s off TTFB; ffmpeg only needs enough bytes to
+        // detect codec params, which is well under 1MB for h264/hevc.
         args.push(
-            '-probesize', '5000000',
-            '-analyzeduration', '5000000',
-            '-fflags', '+genpts+discardcorrupt',
+            '-probesize', '1000000',
+            '-analyzeduration', '1000000',
+            '-fflags', '+genpts+discardcorrupt+nobuffer',
+            '-flags', 'low_delay',
             '-err_detect', 'ignore_err',
             '-reconnect', '1',
             '-reconnect_streamed', '1',
@@ -310,6 +313,12 @@ class TranscodeSession extends EventEmitter {
                     '-hwaccel_output_format', 'qsv'
                 );
                 break;
+            case 'videotoolbox':
+                // Apple VideoToolbox hardware decode + encode (Mac).
+                // Keep frames on CPU because some sources need software filters (e.g. scale).
+                // VideoToolbox encoder accepts yuv420p input, so leave output format unset.
+                args.push('-hwaccel', 'videotoolbox');
+                break;
             case 'amf':
                 // AMD AMF (no hwaccel input, AMF is encode-only)
                 // Decode on CPU, encode on GPU
@@ -335,6 +344,8 @@ class TranscodeSession extends EventEmitter {
             'medium': { nvenc: 24, vaapi: 24, qsv: 24, amf: 24, software: 23 },
             'low': { nvenc: 30, vaapi: 30, qsv: 30, amf: 30, software: 28 }
         };
+        // VideoToolbox uses a different rate-control scheme (bitrate or q-scale 1-100, higher=better).
+        // The matching q values are picked inside addVideoToolboxEncoderArgs based on the `quality` string.
         const qp = qualityPresets[quality] || qualityPresets.medium;
 
         switch (encoder) {
@@ -349,6 +360,9 @@ class TranscodeSession extends EventEmitter {
                 break;
             case 'qsv':
                 this.addQsvEncoderArgs(args, resolution, qp.qsv);
+                break;
+            case 'videotoolbox':
+                this.addVideoToolboxEncoderArgs(args, resolution, quality);
                 break;
             case 'software':
             case 'auto':
@@ -409,10 +423,13 @@ class TranscodeSession extends EventEmitter {
                     return `scale_qsv=w=-2:h=${height}:format=nv12`;
                 case 'amf':
                     // AMF uses CPU decode, so use software scale
-                    return useUpscale ? `scale=-2:${height}:flags=lanczos` : `scale=-2:${height}`;
+                    return useUpscale ? `scale=-2:${height}:flags=lanczos` : `scale=-2:'min(${height},ih)'`;
+                case 'videotoolbox':
+                    // VideoToolbox decodes to CPU memory, software scale is fine.
+                    return useUpscale ? `scale=-2:${height}:flags=lanczos` : `scale=-2:'min(${height},ih)'`;
                 case 'software':
                 default:
-                    return useUpscale ? `scale=-2:${height}:flags=lanczos` : `scale=-2:${height}`;
+                    return useUpscale ? `scale=-2:${height}:flags=lanczos` : `scale=-2:'min(${height},ih)'`;
             }
         }
 
@@ -495,6 +512,31 @@ class TranscodeSession extends EventEmitter {
     }
 
     /**
+     * Apple VideoToolbox encoder (Mac hardware H.264).
+     * Uses constant quality scale (1-100, higher = better). Maps to user-facing quality preset.
+     */
+    addVideoToolboxEncoderArgs(args, height, quality) {
+        args.push('-vf', this.buildScaleFilter('videotoolbox', height));
+
+        // VideoToolbox quality scale: 60 ≈ visually transparent at 1080p, 75 archival, 45 fast.
+        const qScale = ({ high: 70, medium: 60, low: 50 }[quality] ?? 60);
+
+        args.push(
+            '-c:v', 'h264_videotoolbox',
+            '-q:v', String(qScale),
+            '-profile:v', 'high',
+            '-level', '4.1',
+            '-pix_fmt', 'yuv420p',
+            // Realtime hint helps the encoder hit low-latency targets.
+            '-realtime', '1',
+            // Force I-frame at start of each HLS segment so player can seek cleanly.
+            '-g', String(SEGMENT_DURATION * 30),
+            '-keyint_min', String(SEGMENT_DURATION * 30),
+            '-force_key_frames', `expr:gte(t,n_forced*${SEGMENT_DURATION})`
+        );
+    }
+
+    /**
      * Software encoder arguments (fallback)
      */
     addSoftwareEncoderArgs(args, height, crf) {
@@ -558,7 +600,8 @@ class TranscodeSession extends EventEmitter {
             if (await this.isPlaylistReady()) {
                 return true;
             }
-            await new Promise(resolve => setTimeout(resolve, 200));
+            // Tight poll for responsiveness; cheap fs.access calls.
+            await new Promise(resolve => setTimeout(resolve, 75));
         }
         return false;
     }

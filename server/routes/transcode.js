@@ -61,7 +61,7 @@ router.post('/session', async (req, res) => {
         await session.start();
 
         // Wait for playlist to be ready (first segments generated)
-        const ready = await session.waitForPlaylist(15000);
+        const ready = await session.waitForPlaylist(30000);
 
         if (!ready) {
             await transcodeSession.removeSession(session.id);

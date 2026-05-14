@@ -238,6 +238,13 @@ class WatchPage {
                 this.scrollHint?.classList.remove('hidden');
             }
         });
+
+        // Kill transcode session when tab/window closes
+        window.addEventListener('beforeunload', () => {
+            if (this.currentSessionId) {
+                fetch(`/api/transcode/${this.currentSessionId}`, { method: 'DELETE', keepalive: true }).catch(() => {});
+            }
+        });
     }
 
     /**
@@ -470,7 +477,7 @@ class WatchPage {
                     // TODO: Move remux to session logic if seeking is needed for TS files
                     console.log('[WatchPage] Auto: Using remux (.ts container)');
                     this.updateTranscodeStatus('remuxing', 'Remux (Auto)');
-                    const finalUrl = `/api/remux?url=${encodeURIComponent(url)}`;
+                    const finalUrl = `/api/remux?url=${encodeURIComponent(url)}&audioCodec=${encodeURIComponent(info.audio || '')}`;
                     this.video.src = finalUrl;
                     this.video.play().catch(e => {
                         if (e.name !== 'AbortError') console.error('[WatchPage] Autoplay error:', e);

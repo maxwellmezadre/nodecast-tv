@@ -142,7 +142,14 @@ class VideoPlayer {
             // Caption/Subtitle settings
             enableCEA708Captions: true,    // Enable CEA-708 closed captions
             enableWebVTT: true,            // Enable WebVTT subtitles
-            renderTextTracksNatively: true // Use native browser rendering for text tracks
+            renderTextTracksNatively: true, // Use native browser rendering for text tracks
+            // Startup speed: prefetch first fragment in parallel with manifest parse.
+            startFragPrefetch: true,
+            // Don't wait for ABR — start at first level so playback begins immediately.
+            startLevel: 0,
+            // Reduce manifest/fragment retry backoff so transient errors recover faster.
+            manifestLoadingTimeOut: 8000,
+            fragLoadingTimeOut: 12000
         };
     }
 
@@ -935,7 +942,7 @@ class VideoPlayer {
                         // Raw .ts container - use remux
                         console.log('[Player] Auto: Using remux (.ts container)');
                         this.updateTranscodeStatus('remuxing', 'Remux (Auto)');
-                        const remuxUrl = `/api/remux?url=${encodeURIComponent(streamUrl)}`;
+                        const remuxUrl = `/api/remux?url=${encodeURIComponent(streamUrl)}&audioCodec=${encodeURIComponent(info.audio || '')}`;
                         this.currentUrl = remuxUrl;
                         this.video.src = remuxUrl;
                         this.video.play().catch(e => {

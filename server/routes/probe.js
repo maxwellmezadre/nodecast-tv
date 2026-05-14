@@ -33,11 +33,13 @@ function probeStream(url, ffprobePath, userAgent = null, timeout = 15000) {
         const args = [
             '-v', 'error',
             '-user_agent', userAgent || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+            '-allowed_extensions', 'ALL',
             '-print_format', 'json',
             '-show_streams',
             '-show_format',
-            '-probesize', '5000000',
-            '-analyzeduration', '5000000',
+            // Smaller probe (1MB / 1s) is enough to detect codec/container; cuts probe latency.
+            '-probesize', '1000000',
+            '-analyzeduration', '1000000',
             url
         ];
 
@@ -117,8 +119,12 @@ function analyzeProbeResult(probeResult, url) {
     // The frontend will still use "copy" mode if codecs are compatible.
     const isMkv = container.includes('matroska') || container.includes('webm') || url.endsWith('.mkv');
 
-    // 1. Incompatible audio/video OR MKV -> Transcode (or HLS Copy)
-    const needsTranscode = !audioOk || !videoOk || isMkv;
+    // 1. Incompatible audio/video OR MKV OR multichannel audio -> Transcode (or HLS Copy)
+    // Browsers (esp. Chrome on macOS) often play silence on multichannel AAC inside MP4.
+    // Force transcode for >2 channels to downmix to stereo.
+    const audioChannels = audioStream?.channels || 0;
+    const audioMultichannel = audioChannels > 2;
+    const needsTranscode = !audioOk || !videoOk || isMkv || audioMultichannel;
 
     // 2. Compatible audio/video but incompatible container (non-MKV) -> Remux (fMP4 pipe)
     const needsRemux = !needsTranscode && (!containerOk || isRawTs);
@@ -137,6 +143,41 @@ function analyzeProbeResult(probeResult, url) {
         needsTranscode: needsTranscode,
         subtitles: subtitles
     };
+}
+
+/**
+ * Build a synthetic probe result for known Xtream URL patterns to skip the slow ffprobe step.
+ * The vast majority of Xtream provider channels follow the same codec mix per type:
+ *   - /live/.../*.ts          → mpegts h264/aac stereo  (needsRemux)
+ *   - /movie/.../*.mp4|.mkv   → mp4 h264/aac stereo     (compatible / direct play)
+ *   - /series/.../*.mp4|.mkv  → mp4 h264/aac stereo     (compatible / direct play)
+ * Returns null when the URL doesn't fit a known pattern, in which case the caller falls back
+ * to a real probe. A background probe still runs to update the cache with the real answer
+ * so future hits get accurate info if our assumption was wrong.
+ */
+function fastPathFromUrl(url) {
+    if (url.includes('.m3u8')) return null; // HLS playlists need real probe
+    const isLiveTs = /\/live\//.test(url) && /\.ts(\?|$)/.test(url);
+    if (isLiveTs) {
+        return {
+            video: 'h264',
+            audio: 'aac',
+            width: 0,
+            height: 0,
+            audioChannels: 2,
+            container: 'mpegts',
+            compatible: false,
+            needsRemux: true,
+            needsTranscode: false,
+            subtitles: [],
+            __fastPath: true
+        };
+    }
+    // VOD (movies/series) intentionally NOT fast-pathed: a non-trivial share of titles ship
+    // 5.1 AAC, which the browser silently fails to render. Real probe is required to detect
+    // channel count → fall back through transcode. Trading 5s probe latency for a guaranteed
+    // first-play audio is worth it. Background-cache still warms via subsequent plays.
+    return null;
 }
 
 router.get('/', async (req, res) => {
@@ -161,11 +202,28 @@ router.get('/', async (req, res) => {
         });
     }
 
-    // Check cache
+    // Check cache (real cached probe wins over fast-path).
     const cached = probeCache.get(cacheKey);
     if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
         console.log(`[Probe] Cache hit for: ${url.substring(0, 50)}...`);
         return res.json(cached.result);
+    }
+
+    // Fast-path: respond synthetically for well-known Xtream URLs, then validate in the background.
+    const fast = fastPathFromUrl(url);
+    if (fast) {
+        console.log(`[Probe] Fast-path response (background probe queued) for: ${url.substring(0, 50)}...`);
+        res.json(fast);
+        // Fire-and-forget real probe to populate cache with accurate codec info for the next play.
+        probeStream(url, ffprobePath, ua).then(probeResult => {
+            const analysis = analyzeProbeResult(probeResult, url);
+            probeCache.set(cacheKey, { result: analysis, timestamp: Date.now() });
+            console.log(`[Probe] Background probe done: video=${analysis.video}, audio=${analysis.audio}, ` +
+                `${analysis.audioChannels}ch, needsTranscode=${analysis.needsTranscode}`);
+        }).catch(err => {
+            console.warn('[Probe] Background probe failed:', err.message);
+        });
+        return;
     }
 
     console.log(`[Probe] Probing: ${url.substring(0, 80)}... ${ua ? `(UA: ${ua})` : ''}`);

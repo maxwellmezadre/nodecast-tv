@@ -162,6 +162,41 @@ async function detectQuickSync() {
 }
 
 /**
+ * Detect Apple VideoToolbox support (macOS only).
+ * VideoToolbox is the GPU-accelerated video encode/decode API on Apple Silicon and Intel Macs.
+ */
+async function detectVideoToolbox() {
+    if (os.platform() !== 'darwin') {
+        return { available: false, reason: 'VideoToolbox is macOS-only' };
+    }
+
+    try {
+        // Verify ffmpeg has the encoder compiled in.
+        const result = execSync('ffmpeg -hide_banner -encoders 2>/dev/null | grep h264_videotoolbox', {
+            timeout: 3000,
+            encoding: 'utf-8',
+            shell: '/bin/sh'
+        });
+
+        if (!result.includes('h264_videotoolbox')) {
+            return { available: false, reason: 'ffmpeg missing h264_videotoolbox encoder' };
+        }
+
+        const cpuModel = os.cpus()[0]?.model || 'Mac';
+        console.log(`[HwDetect] VideoToolbox available on ${cpuModel}`);
+
+        return {
+            available: true,
+            name: cpuModel,
+            encoder: 'h264_videotoolbox',
+            decoder: 'videotoolbox'
+        };
+    } catch (err) {
+        return { available: false, reason: 'VideoToolbox probe failed' };
+    }
+}
+
+/**
  * Detect AMD AMF support (Windows only)
  * Linux AMD uses VAAPI (detected separately)
  */
@@ -221,16 +256,20 @@ async function detect() {
 
     console.log('[HwDetect] Probing hardware acceleration capabilities...');
 
-    const [nvidia, vaapi, qsv, amf] = await Promise.all([
+    const [nvidia, vaapi, qsv, amf, videotoolbox] = await Promise.all([
         detectNvidia(),
         detectVAAPI(),
         detectQuickSync(),
-        detectAMF()
+        detectAMF(),
+        detectVideoToolbox()
     ]);
 
-    // Determine recommended encoder (priority: NVENC > AMF > QSV > VAAPI > Software)
+    // Determine recommended encoder.
+    // On macOS prefer VideoToolbox; otherwise NVENC > AMF > QSV > VAAPI > Software.
     let recommended = 'software';
-    if (nvidia.available) {
+    if (videotoolbox.available) {
+        recommended = 'videotoolbox';
+    } else if (nvidia.available) {
         recommended = 'nvenc';
     } else if (amf.available) {
         recommended = 'amf';
@@ -245,6 +284,7 @@ async function detect() {
         amf,
         vaapi,
         qsv,
+        videotoolbox,
         recommended,
         platform: os.platform(),
         detectedAt: new Date().toISOString()
@@ -277,5 +317,6 @@ module.exports = {
     detectNvidia,
     detectAMF,
     detectVAAPI,
-    detectQuickSync
+    detectQuickSync,
+    detectVideoToolbox
 };

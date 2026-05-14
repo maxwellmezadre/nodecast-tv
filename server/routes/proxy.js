@@ -660,11 +660,9 @@ router.get('/stream', async (req, res) => {
             if (contentRange) {
                 res.set('Content-Range', contentRange);
             }
-            if (acceptRanges) {
-                res.set('Accept-Ranges', acceptRanges);
-            } else if (contentLength && !contentRange) {
-                // If server supports content-length but didn't explicitly state accept-ranges,
-                // we can safely assume it supports byte ranges
+            // Always set Accept-Ranges to "bytes" (valid HTTP unit).
+            // Some upstream servers send malformed values like "0-620345258" which breaks browser seeking.
+            if (acceptRanges || contentRange || (contentLength && !contentRange)) {
                 res.set('Accept-Ranges', 'bytes');
             }
 
@@ -740,23 +738,25 @@ router.get('/stream', async (req, res) => {
                 return res.send(manifest);
             }
 
-            // Binary content (Video Segment or Key): Collect and send
-            console.log(`[Proxy] Serving binary content (${contentType})`);
+            // Binary content (Video Segment, Key, or full video): stream pipe directly.
+            // Buffering entire response kills TTFB and RAM for large videos (MP4 600MB+).
+            // Content-Length already forwarded from upstream above.
+            console.log(`[Proxy] Streaming binary content (${contentType})`);
             res.set('Content-Type', contentType || 'application/octet-stream');
 
-            // For small files (like encryption keys), collect all data and send at once
-            // This ensures proper Content-Length and response completion
-            const chunks = [firstChunk];
-            let result = await iterator.next();
-            while (!result.done) {
-                chunks.push(Buffer.from(result.value));
-                result = await iterator.next();
-            }
-            const fullContent = Buffer.concat(chunks);
+            // Send the first chunk we already read, then pipe the rest
+            res.write(firstChunk);
 
-            // Set Content-Length for proper client handling
-            res.set('Content-Length', fullContent.length);
-            res.send(fullContent);
+            const bodyStream = Readable.from(iterator);
+            bodyStream.on('error', (err) => {
+                console.error('[Proxy] Body stream error:', err.message);
+                if (!res.writableEnded) res.end();
+            });
+            req.on('close', () => {
+                // Client disconnected: stop pulling from upstream
+                bodyStream.destroy();
+            });
+            bodyStream.pipe(res);
             return; // Success - exit the retry loop
 
         } catch (err) {

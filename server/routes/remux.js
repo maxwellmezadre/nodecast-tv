@@ -14,7 +14,7 @@ const db = require('../db');
  * Note: This does NOT fix Dolby/AC3 audio issues - use /api/transcode for that.
  */
 router.get('/', async (req, res) => {
-    const { url } = req.query;
+    const { url, audioCodec } = req.query;
     if (!url) {
         return res.status(400).json({ error: 'URL parameter is required' });
     }
@@ -34,12 +34,12 @@ router.get('/', async (req, res) => {
         '-hide_banner',
         '-loglevel', 'warning',
         '-user_agent', userAgent,
-        '-user_agent', userAgent,
-        // Standard probe size to handle complex containers (MKV) correctly
-        '-probesize', '5000000',
-        '-analyzeduration', '5000000',
-        // Error resilience: discard corrupt packets, generate timestamps, ignore DTS, no buffering
+        // Small probe (~250KB / 0.5s) → ffmpeg detects mpegts h264/aac fast; cuts ~3-5s off TTFB.
+        '-probesize', '250000',
+        '-analyzeduration', '500000',
+        // Error resilience: discard corrupt packets, generate timestamps, ignore DTS, no buffering, low delay.
         '-fflags', '+genpts+discardcorrupt+igndts+nobuffer',
+        '-flags', 'low_delay',
         // Ignore errors in stream and continue
         '-err_detect', 'ignore_err',
         // Limit max demux delay to prevent buffering issues with bad timestamps
@@ -61,9 +61,9 @@ router.get('/', async (req, res) => {
         '-c', 'copy',
         // Ensure extradata is correctly extracted/converted (fixes Annex B -> AVCC issues in Firefox)
         '-bsf:v', 'dump_extra',
-        // NOTE: We intentionally do NOT use -bsf:a aac_adtstoasc here
-        // That filter only works for AAC audio and breaks AC3/EAC3/MP3.
-        // If AAC audio from MPEG-TS fails in MP4, use /api/transcode instead.
+        // Apply aac_adtstoasc only when audio is AAC (required to mux ADTS AAC from MPEG-TS into MP4).
+        // Skipping for AC3/EAC3/MP3 to avoid breaking those codecs.
+        ...(audioCodec && audioCodec.toLowerCase().includes('aac') ? ['-bsf:a', 'aac_adtstoasc'] : []),
         // Handle timestamp discontinuities at output
         '-fps_mode', 'passthrough',
         '-max_muxing_queue_size', '1024',
