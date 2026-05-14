@@ -34,16 +34,21 @@ router.get('/', async (req, res) => {
         '-hide_banner',
         '-loglevel', 'warning',
         '-user_agent', userAgent,
-        // Small probe (~250KB / 0.5s) → ffmpeg detects mpegts h264/aac fast; cuts ~3-5s off TTFB.
-        '-probesize', '250000',
-        '-analyzeduration', '500000',
+        // Tiny probe (~32KB / 100ms): we already know it's mpegts h264/aac from the probe step.
+        // Forcing `-f mpegts` before `-i` skips container auto-detection entirely.
+        '-f', 'mpegts',
+        '-probesize', '32768',
+        '-analyzeduration', '100000',
         // Error resilience: discard corrupt packets, generate timestamps, ignore DTS, no buffering, low delay.
         '-fflags', '+genpts+discardcorrupt+igndts+nobuffer',
         '-flags', 'low_delay',
         // Ignore errors in stream and continue
         '-err_detect', 'ignore_err',
-        // Limit max demux delay to prevent buffering issues with bad timestamps
-        '-max_delay', '5000000',
+        // Tight demux delay: 0.5s lets ffmpeg emit packets ASAP, slashing TTFB. Bumped only
+        // when DTS reordering needs more headroom (rare for h264 IPTV streams).
+        '-max_delay', '500000',
+        // Larger socket buffer reduces network blip → ffmpeg pause when provider hiccups.
+        '-rtbufsize', '64M',
         // Reconnect settings for network drops
         '-reconnect', '1',
         '-reconnect_streamed', '1',
@@ -67,9 +72,12 @@ router.get('/', async (req, res) => {
         // Handle timestamp discontinuities at output
         '-fps_mode', 'passthrough',
         '-max_muxing_queue_size', '1024',
-        // Fragmented MP4 for streaming (browser-compatible)
+        // Fragmented MP4 for streaming. frag_keyframe emits a moof at every keyframe,
+        // which is the fastest "first playable byte" path for live IPTV. flush_packets
+        // forces ffmpeg to push each output packet to the socket without internal buffering.
         '-f', 'mp4',
         '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+        '-flush_packets', '1',
         '-' // Output to stdout
     ];
 

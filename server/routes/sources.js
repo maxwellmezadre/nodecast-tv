@@ -46,6 +46,47 @@ router.get('/type/:type', async (req, res) => {
     }
 });
 
+// Get Xtream account info (expiration, max devices, etc.).
+// Pulls user_info from the provider via the auth endpoint and trims it to the fields the UI needs.
+router.get('/:id/account-info', async (req, res) => {
+    try {
+        const source = await sources.getById(req.params.id);
+        if (!source) return res.status(404).json({ error: 'Source not found' });
+        if (source.type !== 'xtream') return res.status(400).json({ error: 'Account info only available for Xtream sources' });
+
+        const api = xtreamApi.createFromSource(source);
+        const data = await api.authenticate();
+        const userInfo = data.user_info || {};
+        const serverInfo = data.server_info || {};
+
+        const expUnix = Number(userInfo.exp_date);
+        const expIso = Number.isFinite(expUnix) && expUnix > 0 ? new Date(expUnix * 1000).toISOString() : null;
+
+        res.json({
+            sourceId: source.id,
+            sourceName: source.name,
+            status: userInfo.status || null,
+            username: userInfo.username || null,
+            expDate: expUnix || null,
+            expDateIso: expIso,
+            isTrial: userInfo.is_trial === '1' || userInfo.is_trial === true,
+            maxConnections: Number(userInfo.max_connections) || null,
+            activeConnections: Number(userInfo.active_cons) || 0,
+            createdAt: userInfo.created_at ? Number(userInfo.created_at) : null,
+            allowedFormats: userInfo.allowed_output_formats || null,
+            server: {
+                url: serverInfo.url || null,
+                port: serverInfo.port || null,
+                httpsPort: serverInfo.https_port || null,
+                timezone: serverInfo.timezone || null
+            }
+        });
+    } catch (err) {
+        console.error('Error getting Xtream account info:', err);
+        res.status(502).json({ error: 'Failed to fetch account info', details: err.message });
+    }
+});
+
 // Get single source
 router.get('/:id', async (req, res) => {
     try {

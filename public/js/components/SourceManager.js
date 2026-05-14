@@ -137,6 +137,7 @@ class SourceManager {
         <div class="source-info">
           <div class="source-name">${source.name}</div>
           <div class="source-url">${source.url}</div>
+          ${type === 'xtream' ? `<div class="source-account" data-account="${source.id}"><span class="hint">Loading account info…</span></div>` : ''}
         </div>
         <div class="source-actions">
           <button class="btn btn-sm btn-secondary" data-action="refresh" title="Refresh Data">${Icons.refresh}</button>
@@ -160,6 +161,41 @@ class SourceManager {
             item.querySelector('[data-action="edit"]').addEventListener('click', () => this.showEditModal(id, type));
             item.querySelector('[data-action="delete"]').addEventListener('click', () => this.deleteSource(id));
         });
+
+        // For Xtream sources, fetch and render account info (expiration + max devices) per card.
+        if (type === 'xtream') {
+            sources.forEach(source => this.loadAccountInfo(source.id));
+        }
+    }
+
+    /**
+     * Fetch Xtream account info and render it inside the matching source card.
+     */
+    async loadAccountInfo(sourceId) {
+        const target = document.querySelector(`[data-account="${sourceId}"]`);
+        if (!target) return;
+        try {
+            const info = await API.request('GET', `/sources/${sourceId}/account-info`);
+            const expIso = info.expDateIso;
+            let expLabel = 'Sem data';
+            let expClass = '';
+            if (expIso) {
+                const expDate = new Date(expIso);
+                const daysLeft = Math.ceil((expDate - new Date()) / (1000 * 60 * 60 * 24));
+                expLabel = expDate.toLocaleDateString('pt-BR') + ` (${daysLeft}d)`;
+                if (daysLeft <= 0) expClass = 'expired';
+                else if (daysLeft <= 7) expClass = 'expiring';
+            }
+            const statusBadge = info.status ? `<span class="account-badge status-${(info.status || '').toLowerCase()}">${info.status}</span>` : '';
+            const trialBadge = info.isTrial ? '<span class="account-badge trial">Trial</span>' : '';
+            target.innerHTML = `
+                ${statusBadge}${trialBadge}
+                <span class="account-meta ${expClass}" title="Playlist expiration date">Vence: <strong>${expLabel}</strong></span>
+                <span class="account-meta" title="Connections allowed by provider">Devices: <strong>${info.activeConnections}/${info.maxConnections ?? '?'}</strong></span>
+            `;
+        } catch (err) {
+            target.innerHTML = `<span class="hint">Account info unavailable</span>`;
+        }
     }
 
     /**
