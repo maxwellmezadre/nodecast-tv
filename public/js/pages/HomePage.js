@@ -173,10 +173,18 @@ class HomePage {
             // 0. Load Favorite Channels (first section)
             await this.renderFavoriteChannels();
 
-            // 1. Load Watch History
-            const history = await window.API.request('GET', '/history?limit=12');
-            if (history && Array.isArray(history)) {
-                this.renderHistory(history);
+            // 1. Load Watch History — respect "Show Continue Watching" toggle.
+            const settings = await window.API.request('GET', '/settings').catch(() => ({}));
+            const showContinue = settings?.showContinueWatching !== false; // default true
+            const continueSection = document.getElementById('continue-watching-section');
+            if (!showContinue) {
+                if (continueSection) continueSection.style.display = 'none';
+            } else {
+                if (continueSection) continueSection.style.display = '';
+                const history = await window.API.request('GET', '/history?limit=12');
+                if (history && Array.isArray(history)) {
+                    this.renderHistory(history);
+                }
             }
 
             // 2. Load Recent Items

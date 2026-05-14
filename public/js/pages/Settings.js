@@ -34,6 +34,7 @@ class SettingsPage {
         const volumeValueDisplay = document.getElementById('volume-value');
         const rememberVolumeToggle = document.getElementById('setting-remember-volume');
         const autoPlayNextToggle = document.getElementById('setting-autoplay-next');
+        const showContinueWatchingToggle = document.getElementById('setting-show-continue-watching');
 
         // Load current settings
         if (this.app.player?.settings) {
@@ -43,6 +44,9 @@ class SettingsPage {
             volumeValueDisplay.textContent = this.app.player.settings.defaultVolume + '%';
             rememberVolumeToggle.checked = this.app.player.settings.rememberVolume;
             autoPlayNextToggle.checked = this.app.player.settings.autoPlayNextEpisode;
+            if (showContinueWatchingToggle) {
+                showContinueWatchingToggle.checked = this.app.player.settings.showContinueWatching !== false;
+            }
         }
 
         // Arrow keys toggle
@@ -76,6 +80,14 @@ class SettingsPage {
             this.app.player.settings.autoPlayNextEpisode = autoPlayNextToggle.checked;
             this.app.player.saveSettings();
         });
+
+        // Show Continue Watching toggle — hides the dashboard rail without deleting history.
+        if (showContinueWatchingToggle) {
+            showContinueWatchingToggle.addEventListener('change', () => {
+                this.app.player.settings.showContinueWatching = showContinueWatchingToggle.checked;
+                this.app.player.saveSettings();
+            });
+        }
 
         // EPG refresh interval
         const epgRefreshSelect = document.getElementById('epg-refresh-interval');

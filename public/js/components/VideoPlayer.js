@@ -49,6 +49,7 @@ class VideoPlayer {
             rememberVolume: true,
             lastVolume: 80,
             autoPlayNextEpisode: false,
+            showContinueWatching: true,
             forceProxy: false,
             forceTranscode: false,
             forceRemux: false,
