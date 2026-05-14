@@ -68,6 +68,7 @@ class WatchPage {
         // Transcode Status
         this.transcodeStatusEx = document.getElementById('watch-transcode-status');
         this.qualityBadgeEl = document.getElementById('watch-quality-badge');
+        this.noAudioBadgeEl = document.getElementById('watch-no-audio-badge');
 
         // State
         this.hls = null;
@@ -191,6 +192,10 @@ class WatchPage {
         this.video?.addEventListener('error', (e) => this.onError(e));
         this.video?.addEventListener('waiting', () => this.showLoading());
         this.video?.addEventListener('canplay', () => this.hideLoading());
+        // Whenever a fresh stream starts loading or actually begins playing, clear any
+        // previous "Stream unavailable" overlay so the user isn't stuck with stale state.
+        this.video?.addEventListener('loadstart', () => this.hideStreamUnavailable());
+        this.video?.addEventListener('playing', () => this.hideStreamUnavailable());
 
         // Overlay auto-hide + click to toggle play
         const watchSection = document.querySelector('.watch-video-section');
@@ -414,14 +419,24 @@ class WatchPage {
         } else {
             this.qualityBadgeEl.classList.add('hidden');
         }
+
+        // "No audio" hint: real probe reports audioChannels=0 + audio=unknown when the source
+        // broadcasts no audio stream. Fast-path returns audio=aac+2ch, so the badge only
+        // surfaces after the background probe lands (≈5s) — that's fine, it's an idle indicator.
+        if (this.noAudioBadgeEl) {
+            const info = this.currentStreamInfo;
+            const hasNoAudio = info && info.audioChannels === 0 && (!info.audio || info.audio === 'unknown');
+            this.noAudioBadgeEl.classList.toggle('hidden', !hasNoAudio);
+        }
     }
 
     async loadVideo(url) {
         // Store the URL for copy functionality
         this.currentUrl = url;
 
-        // Stop any existing playback
+        // Stop any existing playback + clear any previous error overlay
         this.stop();
+        this.hideStreamUnavailable();
 
         // Show loading spinner
         this.showLoading();
@@ -451,6 +466,22 @@ class WatchPage {
                 // Store early probe info for quality display
                 this.currentStreamInfo = info;
                 this.updateQualityBadge();
+
+                // Fast-path returns a synthetic stereo-aac assumption. Re-fetch once the
+                // background probe (~5s) has populated the cache so the "No audio" badge
+                // can surface for video-only channels on the first play.
+                if (info.__fastPath) {
+                    const probedUrl = url;
+                    setTimeout(async () => {
+                        if (this.currentUrl !== probedUrl) return; // user navigated away
+                        try {
+                            const fresh = await fetch(`/api/probe?url=${encodeURIComponent(url)}&ua=${encodeURIComponent(ua || '')}`).then(r => r.json());
+                            if (!fresh || fresh.__fastPath) return; // cache still stale
+                            this.currentStreamInfo = fresh;
+                            this.updateQualityBadge();
+                        } catch {}
+                    }, 6000);
+                }
 
                 if (info.needsTranscode || settings.upscaleEnabled) {
                     console.log(`[WatchPage] Auto: Using HLS transcode session (${settings.upscaleEnabled ? 'Upscaling' : 'Incompatible audio/video'})`);
@@ -632,10 +663,13 @@ class WatchPage {
         this.stopTranscodeSession();
         this.updateTranscodeStatus('hidden');
 
-        // Hide quality badge
+        // Hide quality + no-audio badges
         this.currentStreamInfo = null;
         if (this.qualityBadgeEl) {
             this.qualityBadgeEl.classList.add('hidden');
+        }
+        if (this.noAudioBadgeEl) {
+            this.noAudioBadgeEl.classList.add('hidden');
         }
 
         if (this.hls) {
@@ -861,9 +895,64 @@ class WatchPage {
     onError(e) {
         // Only log actual fatal errors, not benign stream recovery events
         const error = this.video?.error;
-        if (error && error.code) {
-            console.error('[WatchPage] Video error:', error.code, error.message);
+        if (!error || !error.code) return;
+        console.error('[WatchPage] Video error:', error.code, error.message);
+        // Ignore the "empty src" code 4 that the browser fires when the <video> element
+        // gets src="" during a stop/reset — that's not a real upstream failure.
+        const src = this.video?.currentSrc || this.video?.src || '';
+        if (!src) return;
+        if (error.code !== 4) return; // code 2/3 frequently recover; only SRC_NOT_SUPPORTED is fatal
+        // Debounce heavily: a transient error fires during channel/episode switch (old
+        // HLS/HLS.js teardown) AND during slow provider startup. Wait 15s, then verify the
+        // video is still completely stuck (readyState=0, no buffered ranges, error still set,
+        // and the src hasn't changed) before showing the overlay.
+        if (this.streamErrorTimer) clearTimeout(this.streamErrorTimer);
+        const erroredSrc = this.video?.currentSrc || this.video?.src || '';
+        this.streamErrorTimer = setTimeout(() => {
+            this.streamErrorTimer = null;
+            if (!this.video) return;
+            const currentSrc = this.video.currentSrc || this.video.src || '';
+            if (currentSrc !== erroredSrc) return; // user switched away
+            const stillBlank = this.video.readyState === 0 && this.video.buffered.length === 0;
+            const stillErrored = this.video.error && this.video.error.code === 4;
+            if (stillBlank && stillErrored) this.showStreamUnavailable();
+        }, 15000);
+    }
+
+    /**
+     * Surface an unavailable-stream message instead of leaving the spinner running forever.
+     */
+    showStreamUnavailable(reason) {
+        this.hideLoading();
+        let overlay = document.getElementById('watch-stream-error');
+        if (!overlay) {
+            overlay = document.createElement('div');
+            overlay.id = 'watch-stream-error';
+            overlay.className = 'stream-error-overlay';
+            overlay.innerHTML = `
+                <div class="stream-error-card">
+                    <div class="stream-error-icon">⚠</div>
+                    <h3>Stream unavailable</h3>
+                    <p class="stream-error-msg">The provider is not serving this stream right now. Try another channel or episode.</p>
+                </div>
+            `;
+            const container = document.querySelector('.watch-video-section') || this.video?.parentElement;
+            container?.appendChild(overlay);
         }
+        if (reason) {
+            const msg = overlay.querySelector('.stream-error-msg');
+            if (msg) msg.textContent = reason;
+        }
+        overlay.classList.add('show');
+    }
+
+    hideStreamUnavailable() {
+        if (this.streamErrorTimer) {
+            clearTimeout(this.streamErrorTimer);
+            this.streamErrorTimer = null;
+        }
+        const overlay = document.getElementById('watch-stream-error');
+        if (overlay) overlay.classList.remove('show');
     }
 
     updateVolumeUI() {

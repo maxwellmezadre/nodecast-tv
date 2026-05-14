@@ -34,19 +34,20 @@ router.get('/', async (req, res) => {
         '-hide_banner',
         '-loglevel', 'warning',
         '-user_agent', userAgent,
-        // Tiny probe (~32KB / 100ms): we already know it's mpegts h264/aac from the probe step.
-        // Forcing `-f mpegts` before `-i` skips container auto-detection entirely.
+        // Probe budget tuned for IPTV: 1MB / 2s lets ffmpeg find audio PIDs in streams
+        // with sparse audio packets (some channels send video for several seconds before
+        // the first audio PES). Forcing `-f mpegts` skips container auto-detection.
         '-f', 'mpegts',
-        '-probesize', '32768',
-        '-analyzeduration', '100000',
+        '-probesize', '1000000',
+        '-analyzeduration', '2000000',
         // Error resilience: discard corrupt packets, generate timestamps, ignore DTS, no buffering, low delay.
         '-fflags', '+genpts+discardcorrupt+igndts+nobuffer',
         '-flags', 'low_delay',
         // Ignore errors in stream and continue
         '-err_detect', 'ignore_err',
-        // Tight demux delay: 0.5s lets ffmpeg emit packets ASAP, slashing TTFB. Bumped only
-        // when DTS reordering needs more headroom (rare for h264 IPTV streams).
-        '-max_delay', '500000',
+        // Demux delay of 2s — tight enough to keep TTFB low while tolerating DTS reordering
+        // and brief network hiccups from the upstream.
+        '-max_delay', '2000000',
         // Larger socket buffer reduces network blip → ffmpeg pause when provider hiccups.
         '-rtbufsize', '64M',
         // Reconnect settings for network drops
@@ -56,10 +57,10 @@ router.get('/', async (req, res) => {
         // Prevent Range/HEAD requests that some providers reject with 405
         '-seekable', '0',
         '-i', url,
-        // STRICT MAPPING: Only map video and audio, ignore subtitles/data/attachments
-        // This prevents remux failure when source container has incompatible subtitle tracks (e.g. MKV -> MP4)
-        '-map', '0:v',
-        '-map', '0:a',
+        // Map only video and audio; trailing `?` makes both optional, so a stream that
+        // hasn't surfaced audio yet within the probe window still produces a valid output.
+        '-map', '0:v:0?',
+        '-map', '0:a:0?',
         // Drop subtitles (-sn) and data (-dn) explicitly
         '-sn', '-dn',
         // Copy streams without re-encoding
@@ -91,17 +92,33 @@ router.get('/', async (req, res) => {
         return res.status(500).json({ error: 'FFmpeg spawn failed', details: spawnErr.message });
     }
 
-    // Set headers for fragmented MP4
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    // Headers are deferred until we know whether ffmpeg actually produced output.
+    // This lets us send a proper 502 with a JSON error when the upstream is broken
+    // (404/403/I/O error) instead of streaming 0 bytes as "video/mp4".
+    let bytesWritten = 0;
+    let stderrTail = '';
+    let headerSent = false;
 
-    // Pipe stdout to response
-    ffmpeg.stdout.pipe(res);
+    const sendVideoHeaders = () => {
+        if (headerSent || res.headersSent) return;
+        headerSent = true;
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Access-Control-Allow-Origin', '*');
+    };
 
-    // Log stderr (useful for debugging)
+    ffmpeg.stdout.on('data', (chunk) => {
+        bytesWritten += chunk.length;
+        sendVideoHeaders();
+        // Manual write keeps us in control of the response state machine.
+        if (!res.writableEnded) res.write(chunk);
+    });
+    // Deliberately NOT closing the response on stdout 'end' — that fires before ffmpeg's
+    // own exit event and would emit a 200 even when ffmpeg failed before writing anything.
+    // The exit handler below decides whether to end with success or 502.
+
     ffmpeg.stderr.on('data', (data) => {
         const msg = data.toString();
-        // Only log warnings/errors, not progress
+        stderrTail = (stderrTail + msg).slice(-2000);
         if (msg.includes('Warning') || msg.includes('Error') || msg.includes('error')) {
             console.log(`[Remux FFmpeg] ${msg}`);
         }
@@ -109,18 +126,38 @@ router.get('/', async (req, res) => {
 
     // Cleanup on client disconnect
     req.on('close', () => {
-        console.log('[Remux] Client disconnected, killing FFmpeg process');
-        ffmpeg.kill('SIGKILL');
+        if (!ffmpeg.killed) {
+            console.log('[Remux] Client disconnected, killing FFmpeg process');
+            ffmpeg.kill('SIGKILL');
+        }
     });
 
-    // Handle process exit
+    // Map common ffmpeg failure modes to a user-friendly error message.
+    function categorizeUpstreamFailure(tail) {
+        const lower = tail.toLowerCase();
+        if (lower.includes('404 not found')) return { reason: 'not_found', message: 'Stream not found on provider (404)' };
+        if (lower.includes('403 forbidden')) return { reason: 'forbidden', message: 'Provider denied access to this stream (403)' };
+        if (lower.includes('connection refused') || lower.includes('connection reset')) return { reason: 'unreachable', message: 'Provider is unreachable' };
+        if (lower.includes('input/output error') || lower.includes('end of file') || lower.includes('stream ends prematurely')) {
+            return { reason: 'broken_upstream', message: 'Upstream returned an empty or broken stream' };
+        }
+        if (lower.includes('could not find codec parameters')) return { reason: 'no_codec', message: 'Could not detect stream codecs' };
+        return { reason: 'unknown', message: 'Stream unavailable' };
+    }
+
     ffmpeg.on('exit', (code) => {
         if (code !== null && code !== 0 && code !== 255) {
             console.error(`[Remux] FFmpeg exited with code ${code}`);
         }
+        // No bytes piped → ffmpeg never opened a usable output stream. Surface as 502.
+        if (bytesWritten === 0 && !headerSent && !res.headersSent && !res.writableEnded) {
+            const failure = categorizeUpstreamFailure(stderrTail);
+            res.status(502).json({ error: failure.message, reason: failure.reason });
+        } else if (!res.writableEnded) {
+            res.end();
+        }
     });
 
-    // Handle spawn errors
     ffmpeg.on('error', (err) => {
         console.error('[Remux] Failed to spawn FFmpeg:', err);
         if (!res.headersSent) {

@@ -4262,6 +4262,59 @@ kbd {
   box-shadow: 0 0 10px rgba(156, 39, 176, 0.4);
 }
 
+/* Full-player overlay shown when the upstream stream cannot be played. */
+.stream-error-overlay {
+  position: absolute;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.82);
+  z-index: 50;
+  backdrop-filter: blur(6px);
+}
+.stream-error-overlay.show { display: flex; }
+.stream-error-card {
+  text-align: center;
+  color: #fff;
+  max-width: 420px;
+  padding: 24px 28px;
+}
+.stream-error-icon {
+  font-size: 3rem;
+  margin-bottom: 8px;
+  color: #f59e0b;
+}
+.stream-error-card h3 {
+  margin: 0 0 8px;
+  font-size: 1.25rem;
+}
+.stream-error-card .stream-error-msg {
+  margin: 0;
+  font-size: 0.95rem;
+  color: rgba(255, 255, 255, 0.85);
+  line-height: 1.4;
+}
+
+/* "No audio" indicator: shown when the source stream broadcasts no audio track. */
+.no-audio-badge {
+  padding: 4px 8px;
+  border-radius: 4px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #fff;
+  background: rgba(220, 38, 38, 0.85);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  backdrop-filter: blur(4px);
+  box-shadow: 0 0 8px rgba(220, 38, 38, 0.4);
+}
+.no-audio-badge::before {
+  content: '🔇';
+  font-size: 0.9rem;
+}
+
 .transcode-status.hidden {
   opacity: 0;
   pointer-events: none;

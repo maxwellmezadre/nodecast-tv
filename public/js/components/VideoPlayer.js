@@ -16,6 +16,38 @@ class VideoPlayer {
         if (this.video) {
             this.video.setAttribute('playsinline', '');
             this.video.setAttribute('webkit-playsinline', '');
+            // Surface a "Stream unavailable" overlay when the upstream stream is broken
+            // (403/404/empty body) instead of leaving the spinner running indefinitely.
+            // Only code 4 (SRC_NOT_SUPPORTED) is treated as fatal; codes 2/3 frequently
+            // recover after HLS.js / browser retries. Empty src is ignored (init artifact).
+            // Debounce: HLS.js / channel-switch teardown fires a spurious code-4 — wait 2s
+            // and confirm the video is still stuck before showing the overlay.
+            this.video.addEventListener('error', () => {
+                const err = this.video.error;
+                const erroredSrc = this.video.currentSrc || this.video.src || '';
+                if (!err || err.code !== 4 || !erroredSrc) return;
+                // 15s wait + strict re-check: video must remain blank, errored, and still
+                // pointing at the same src. Anything less than that = transient teardown.
+                if (this.streamErrorTimer) clearTimeout(this.streamErrorTimer);
+                this.streamErrorTimer = setTimeout(() => {
+                    this.streamErrorTimer = null;
+                    const currentSrc = this.video.currentSrc || this.video.src || '';
+                    if (currentSrc !== erroredSrc) return;
+                    const stillBlank = this.video.readyState === 0 && this.video.buffered.length === 0;
+                    const stillErrored = this.video.error && this.video.error.code === 4;
+                    if (stillBlank && stillErrored) this.showStreamUnavailable();
+                }, 15000);
+            });
+            // Clear the overlay every time a fresh stream starts loading or actually plays.
+            const clearOverlay = () => {
+                if (this.streamErrorTimer) {
+                    clearTimeout(this.streamErrorTimer);
+                    this.streamErrorTimer = null;
+                }
+                this.hideStreamUnavailable();
+            };
+            this.video.addEventListener('loadstart', clearOverlay);
+            this.video.addEventListener('playing', clearOverlay);
         }
 
         this.container = document.querySelector('.video-container');
@@ -891,6 +923,22 @@ class VideoPlayer {
                     this.currentStreamInfo = info;
                     this.updateQualityBadge();
 
+                    // Fast-path returns a synthetic stereo-aac assumption. Re-fetch once the
+                    // background probe (~5s) has populated the cache so the "No audio" badge
+                    // can surface for video-only channels on the first play.
+                    if (info.__fastPath) {
+                        const probedUrl = streamUrl;
+                        setTimeout(async () => {
+                            if (this.currentUrl !== probedUrl) return;
+                            try {
+                                const fresh = await fetch(`/api/probe?url=${encodeURIComponent(streamUrl)}`).then(r => r.json());
+                                if (!fresh || fresh.__fastPath) return;
+                                this.currentStreamInfo = fresh;
+                                this.updateQualityBadge();
+                            } catch {}
+                        }, 6000);
+                    }
+
                     // Handle subtitles from probe result
                     // Clear existing remote tracks (from previous streams)
                     const oldTracks = this.video.querySelectorAll('track');
@@ -1255,15 +1303,53 @@ class VideoPlayer {
     /**
      * Update quality badge display
      */
+    /**
+     * Surface an unavailable-stream overlay over the live-TV player. Matches the
+     * pattern used in WatchPage. Hidden again next time a new channel starts playing.
+     */
+    showStreamUnavailable(reason) {
+        let overlay = document.getElementById('player-stream-error');
+        if (!overlay) {
+            overlay = document.createElement('div');
+            overlay.id = 'player-stream-error';
+            overlay.className = 'stream-error-overlay';
+            overlay.innerHTML = `
+                <div class="stream-error-card">
+                    <div class="stream-error-icon">⚠</div>
+                    <h3>Stream unavailable</h3>
+                    <p class="stream-error-msg">The provider is not serving this channel right now. Try another channel.</p>
+                </div>
+            `;
+            (this.container || this.video?.parentElement)?.appendChild(overlay);
+        }
+        if (reason) {
+            const msg = overlay.querySelector('.stream-error-msg');
+            if (msg) msg.textContent = reason;
+        }
+        overlay.classList.add('show');
+    }
+
+    hideStreamUnavailable() {
+        document.getElementById('player-stream-error')?.classList.remove('show');
+    }
+
     updateQualityBadge() {
         const badge = document.getElementById('player-quality-badge');
-        if (!badge) return;
+        if (badge) {
+            if (this.currentStreamInfo?.height > 0) {
+                badge.textContent = this.getQualityLabel(this.currentStreamInfo.height);
+                badge.classList.remove('hidden');
+            } else {
+                badge.classList.add('hidden');
+            }
+        }
 
-        if (this.currentStreamInfo?.height > 0) {
-            badge.textContent = this.getQualityLabel(this.currentStreamInfo.height);
-            badge.classList.remove('hidden');
-        } else {
-            badge.classList.add('hidden');
+        // "No audio" hint: shown when the source has no audio stream at all.
+        const noAudioBadge = document.getElementById('player-no-audio-badge');
+        if (noAudioBadge) {
+            const info = this.currentStreamInfo;
+            const hasNoAudio = info && info.audioChannels === 0 && (!info.audio || info.audio === 'unknown');
+            noAudioBadge.classList.toggle('hidden', !hasNoAudio);
         }
     }
 
